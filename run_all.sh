@@ -1,6 +1,5 @@
 #!/bin/bash
 # usage: ./run_all.sh <n> <r> <k> <host> <port>
-# Example: ./run_all.sh 3 5 1 localhost 5000
 
 N=$1
 R=$2
@@ -14,8 +13,7 @@ if [ -z "$N" ] || [ -z "$R" ] || [ -z "$K" ]; then
 fi
 
 for (( i=1; i<=N; i++ )); do
-  java ClientProcess $i $HOST $PORT $R $K &
-  # iniciamos em background; "sem retardo" definido no enunciado: iniciados sequencialmente mas sem sleep
+  java -cp target/classes org.cefet.sist_conc_dist.ClientProcess $i $HOST $PORT $R $K &
 done
 
 echo "Started $N processes."
