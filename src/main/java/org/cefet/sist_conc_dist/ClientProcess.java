@@ -1,38 +1,70 @@
 package org.cefet.sist_conc_dist;// ClientProcess.java
+import org.cefet.sist_conc_dist.enums.Operation;
+
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 
-public class ClientProcess {
-    private static final int REQ = 1;
-    private static final int GNT = 2;
-    private static final int REL = 3;
-
-    private static final int F = 64; // same fixed length
+public class ClientProcess extends BaseProcess{
     private final int pid;
     private final String host;
-    private final int port;
-    private final int r; // repetitions
-    private final int k; // sleep seconds in critical section
+    private final int repeticoes; // repetitions
+    private final int segundosDormindo; // segundos dormindo
 
-    public ClientProcess(int pid, String host, int port, int r, int k) {
+    public ClientProcess(int pid, String host, int port, int repeticoes, int segundosDormindo) {
         this.pid = pid;
         this.host = host;
         this.port = port;
-        this.r = r;
-        this.k = k;
+        this.repeticoes = repeticoes;
+        this.segundosDormindo = segundosDormindo;
     }
 
     public void start() throws IOException {
         Socket socket = new Socket(host, port);
-        System.out.println("Process " + pid + " connected to coordinator.");
+        System.out.println("Process " + pid + " conectado com o coordinator.");
 
-        // reader thread to receive GRANT messages
+
         final Object grantLock = new Object();
         final boolean[] granted = {false};
 
+        // instancia uma thread leitora para ler mensagens de grant.
+        Thread reader = getReaderThread(socket, grantLock, granted);
+        reader.start();
+
+        OutputStream out = socket.getOutputStream();
+
+        for (int i = 0; i < repeticoes; i++) {
+            // envia um REQUEST
+            sendMessage(out, buildMessage(Operation.REQ.getEnumerated(), pid));
+            System.out.println("pid " + pid + " mandou REQUEST (" + (i+1) + "/" + repeticoes + ")");
+
+            synchronized (grantLock) {
+                while (!granted[0]) {
+                    try {
+                        grantLock.wait(); // espera o grant para entrar na RC
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                granted[0] = false; // reset no lock
+            }
+            System.out.println("pid " + pid + " recebeu GRANT, entrando na região critica.");
+
+            writeResult();
+            // coloca a thread para dormir simulando acesso a regiao critica
+            try { Thread.sleep(segundosDormindo * 1000L); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+            sendMessage(out, buildMessage(Operation.REL.getEnumerated(), pid)); // envia release para o coordinator
+            System.out.println("pid " + pid + " envia RELEASE (" + (i+1) + "/" + repeticoes + ")");
+        }
+
+        System.out.println("pid " + pid + " terminou a execução de todas as repetições. Saindo.");
+        socket.close(); // fecha o socket.
+    }
+
+    private Thread getReaderThread(Socket socket, Object grantLock, boolean[] granted) {
         Thread reader = new Thread(() -> {
             try (InputStream in = socket.getInputStream()) {
                 byte[] buf = new byte[F];
@@ -44,54 +76,20 @@ public class ClientProcess {
                         read += r;
                     }
                     String msg = new String(buf, StandardCharsets.UTF_8).trim();
-                    int type = parseType(msg);
-                    if (type == GNT) {
-                        // explicar
+                    Operation type = Operation.fromNumber(parseType(msg));
+                    if (type == Operation.GNT) {
                         synchronized (grantLock) {
                             granted[0] = true;
                             grantLock.notify();
                         }
-                    } else {
-                        // ignore other types
                     }
                 }
             } catch (Exception e) {
-                // server might close at end
                 // e.printStackTrace();
             }
         }, "reader-" + pid);
-        reader.setDaemon(true); // explicar
-        reader.start();
-
-        OutputStream out = socket.getOutputStream();
-
-        for (int i = 0; i < r; i++) {
-            // send REQUEST
-            sendMessage(out, buildMessage(REQ, pid));
-            System.out.println("pid " + pid + " sent REQUEST (" + (i+1) + "/" + r + ")");
-            // wait for GRANT
-            synchronized (grantLock) {
-                while (!granted[0]) {
-                    try {
-                        grantLock.wait();
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                }
-                granted[0] = false; // reset
-            }
-            System.out.println("pid " + pid + " received GRANT, entering critical section.");
-            // write to resultado.txt
-            writeResult(); // explicar
-            // sleep k seconds
-            try { Thread.sleep(k * 1000L); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-            // send RELEASE
-            sendMessage(out, buildMessage(REL, pid));
-            System.out.println("pid " + pid + " sent RELEASE (" + (i+1) + "/" + r + ")");
-        }
-
-        System.out.println("pid " + pid + " finished all repetitions. Exiting.");
-        socket.close();
+        reader.setDaemon(true);
+        return reader;
     }
 
     private void writeResult() {
@@ -127,16 +125,23 @@ public class ClientProcess {
 
     public static void main(String[] args) throws Exception {
         // args: pid host port r k
+        // pid -> numero que vai identificar o processo
+        // host -> host do coordinator (localhost normalmente) para conexão do socket
+        // port -> porta do coordinator para conexão do socket
+        // r -> numeroRepeticoes
+        // k -> segundos dormindo
+
         if (args.length < 5) {
-            System.out.println("Usage: java ClientProcess <pid> <host> <port> <r> <k>");
+            System.out.println("Usage: java ClientProcess <pid> <host> <port> <numeroRepeticoes> <segundosDormindo>");
             return;
         }
         int pid = Integer.parseInt(args[0]);
         String host = args[1];
         int port = Integer.parseInt(args[2]);
-        int r = Integer.parseInt(args[3]);
-        int k = Integer.parseInt(args[4]);
-        ClientProcess cp = new ClientProcess(pid, host, port, r, k);
+        int numRepeticoes = Integer.parseInt(args[3]);
+        int segundosDormindo = Integer.parseInt(args[4]);
+
+        ClientProcess cp = new ClientProcess(pid, host, port, numRepeticoes, segundosDormindo);
         cp.start();
     }
 }
