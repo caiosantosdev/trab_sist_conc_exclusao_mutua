@@ -3,11 +3,10 @@
 
 N=$1
 R=$2
-K=$3
 HOST=${4:-localhost}
 PORT=${5:-5000}
 
-if [ -z "$N" ] || [ -z "$R" ] || [ -z "$K" ]; then
+if [ -z "$N" ] || [ -z "$R" ]; then
   echo "Usage: $0 <n> <r> <k> [host] [port]"
   exit 1
 fi

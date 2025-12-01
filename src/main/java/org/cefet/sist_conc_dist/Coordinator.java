@@ -8,7 +8,6 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
-import java.util.Map;
 import java.util.concurrent.*;
 
 public class Coordinator extends BaseProcess{
@@ -19,11 +18,12 @@ public class Coordinator extends BaseProcess{
     // queue of process ids requesting CS
     private final LinkedBlockingQueue<Integer> requestQueue = new LinkedBlockingQueue<>();
 
-    // latches per pid for waiting for RELEASE
-    private final ConcurrentHashMap<Integer, CountDownLatch> releaseLatches = new ConcurrentHashMap<>();
+    private Integer currentProcess = null;
 
     private final File logFile = new File("coordinator_log.txt");
     private final Object logLock = new Object();
+
+    private final Object algorithmLock = new Object();
 
     public Coordinator(int port) {
         this.port = port;
@@ -37,49 +37,10 @@ public class Coordinator extends BaseProcess{
         Thread acceptor = getAcceptorThread(serverSocket);
         acceptor.start();
 
-        // dispatcher thread: take from requestQueue, send GRANT, wait for RELEASE
-        Thread dispatcher = getDispatcherThread();
-        dispatcher.start();
-
         // interface thread: reads console commands
         Thread uiThread = getUIThread();
         uiThread.setDaemon(true);
         uiThread.start();
-    }
-
-    private void printUiHelp() {
-        System.out.println("Comandos: ");
-        System.out.println("1 -> imprimir a fila de pedidos atual");
-        System.out.println("2 -> imprimir quantas vezes cada processo foi atendido (do log)");
-        System.out.println("3 -> encerrar a execução");
-        System.out.println("h -> ajuda");
-    }
-
-    private void printServiceCounts() {
-        ConcurrentHashMap<Integer, Integer> counts = new ConcurrentHashMap<>();
-        if (!logFile.exists()) {
-            System.out.println("Log não existe ainda.");
-            return;
-        }
-        try (BufferedReader br = new BufferedReader(new FileReader(logFile))) {
-            String l;
-            while ((l = br.readLine()) != null) {
-                if (l.contains("SENT_GRANT")) {
-                    String[] parts = l.split("\\s+");
-                    // assume last token is pid:x
-                    for (String p : parts) {
-                        if (p.startsWith("pid:")) {
-                            int pid = Integer.parseInt(p.substring(4));
-                            counts.merge(pid, 1, Integer::sum);
-                        }
-                    }
-                }
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-        System.out.println("Atendimentos por processo:");
-        counts.forEach((k, v) -> System.out.println("pid " + k + ": " + v));
     }
 
     private Thread getAcceptorThread(ServerSocket serverSocket){
@@ -103,45 +64,21 @@ public class Coordinator extends BaseProcess{
             try (InputStream in = s.getInputStream()) {
                 byte[] buf = new byte[F];
                 while (true) {
-                    //inicio leitura
                     int read = 0;
-
                     while (read < F) {
-                        int r = in.read(buf, read, F - read); // espera mensagem do cliente no cano de input stream
+                        int r = in.read(buf, read, F - read);
                         if (r == -1) throw new EOFException("client disconnected");
                         read += r;
                     }
-                    String msg = new String(buf, StandardCharsets.UTF_8);
-                    // fim leitura
-                    Message parsed = parseMessage(msg);
-                    if (parsed == null) { // mensagem mal parseada
-                        log("INVALID_MSG", -1);
-                        continue;
+                    String msgStr = new String(buf, StandardCharsets.UTF_8);
+                    Message parsed = parseMessage(msgStr);
+
+                    if (parsed != null) {
+                        clientSockets.putIfAbsent(parsed.getPid(), s);
+
+                        // Dispatcher aqui
+                        processMessage(parsed);
                     }
-                    int pid = parsed.getPid();
-
-                    // registra o socket na lista de sockets se for a primeira vez.
-                    clientSockets.putIfAbsent(pid, s);
-
-                    Operation type = Operation.fromNumber(parsed.getType());
-
-                    // inicio tratamento tipo
-                    if (type == Operation.REQ) {
-                        log("RECEIVED_REQUEST", pid);
-                        requestQueue.put(pid);
-                    } else if (type == Operation.REL) {
-                        log("RECEIVED_RELEASE", pid);
-                        // signal latch if present
-                        CountDownLatch latch = releaseLatches.get(pid);
-                        if (latch != null) {
-                            latch.countDown();
-                        } else {
-                            log("RELEASE_WITHOUT_LATCH", pid);
-                        }
-                    } else {
-                        log("UNKNOWN_TYPE", pid);
-                    }
-                    //fim tratamento tipo
                 }
             } catch (EOFException eof) {
                 System.out.println("Client disconnected: " + s);
@@ -151,41 +88,65 @@ public class Coordinator extends BaseProcess{
         }, "reader-" + s.getRemoteSocketAddress());
     }
 
-    private Thread getDispatcherThread(){
-        return new Thread(() -> {
-            while (true) {
-                try {
-                    int pid = requestQueue.take(); // bloqueia se nao tiver requisicao e espera ate ter.
-                    log("DEQUEUED_REQUEST", pid);
-                    Socket s = clientSockets.get(pid);
-                    if (s == null || s.isClosed()) {
-                        log("SKIP_NO_SOCKET", pid);
-                        continue; // pula se socket desconectado
-                    }
-                    // prepara o latch
-                    CountDownLatch latch = new CountDownLatch(1);
-                    releaseLatches.put(pid, latch); // envia na lista de releases.
+    private synchronized void processMessage(Message m) throws IOException, InterruptedException {
+        System.out.println("Chegou process message");
+        Operation type = Operation.fromNumber(m.getType());
+        int pid = m.getPid();
+        System.out.println(type);
 
-                    // envia GRANT
-                    sendMessage(s, buildMessage(Operation.GNT.getEnumerated(), pid));
-                    log("SENT_GRANT", pid);
+        if (type == Operation.REQ) {
+            log("RECEIVED_REQUEST", pid);
 
-                    try {
-                        latch.await(); // Bloqueia ate o countDown ( quando release do cliente chegar no reader )
-                        log("RECEIVED_RELEASE_FOR", pid);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    } finally {
-                        releaseLatches.remove(pid);
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
+            // Checa se está livre
+            if (currentProcess == null) {
+                // Se estiver livre, manda o grant e marca ocupado
+                currentProcess = pid;
+                sendGrant(pid);
+            } else {
+                System.out.println("RC ocupada, adicionando na fila.");
+                // Se não estiver, adiciona na fila de requests (espera)
+                requestQueue.add(pid);
+                System.out.println("Fila atual: " + requestQueue);
+                log("QUEUE_ADD", pid);
             }
-        }, "dispatcher-thread");
+
+        } else if (type == Operation.REL) {
+            log("RECEIVED_RELEASE", pid);
+
+            // Verifica se quem mandou o release é quem realmente estava lá
+            if (currentProcess != null && currentProcess == pid) {
+                currentProcess = null; // Libera a RC
+
+                // Se a fila não estiver vazia (tem clientes esperando)
+                if (!requestQueue.isEmpty()) {
+                    int nextPid = requestQueue.poll(); // Tira da fila
+                    System.out.println("REL recebido, retidando da fila.");
+                    System.out.println("Fila atual: " + requestQueue);
+                    currentProcess = nextPid; // Marca como novo ocupante
+                    sendGrant(nextPid); // Dá o grant
+                }
+            } else {
+                log("ERROR_RELEASE_INVALID_OWNER", pid);
+            }
+        } else {
+            log("UNKNOWN_MSG_TYPE", pid);
+        }
+
+    }
+
+    private void sendGrant(int pid) {
+        Socket s = clientSockets.get(pid);
+        if (s != null && !s.isClosed()) {
+            try {
+                sendMessage(s, buildMessage(Operation.GNT.getEnumerated(), pid));
+                log("SENT_GRANT", pid);
+            } catch (IOException e) {
+                e.printStackTrace();
+                log("ERROR_SENDING_GRANT", pid);
+            }
+        } else {
+            log("ERROR_SOCKET_NOT_FOUND", pid);
+        }
     }
 
     private Thread getUIThread(){
@@ -196,16 +157,17 @@ public class Coordinator extends BaseProcess{
                 while ((line = console.readLine()) != null) {
                     line = line.trim();
                     if (line.equalsIgnoreCase("1")) {
-                        System.out.println("Current queue: " + this.requestQueue);
+                        // Sincroniza para leitura segura
+                        synchronized (algorithmLock) {
+                            System.out.println("Ocupante Atual: " + (currentProcess == null ? "[Ninguém]" : currentProcess));
+                            System.out.println("Fila de Espera: " + this.requestQueue);
+                        }
                     } else if (line.equalsIgnoreCase("2")) {
                         printServiceCounts();
                     } else if (line.equalsIgnoreCase("3")) {
-                        System.out.println("Shutting down coordinator...");
                         System.exit(0);
-                    } else if (line.equalsIgnoreCase("h") || line.equalsIgnoreCase("help")) {
+                    } else if (line.equalsIgnoreCase("h")) {
                         printUiHelp();
-                    } else {
-                        System.out.println("Comando desconhecido. 'h' para ajuda.");
                     }
                 }
             } catch (IOException e) {
@@ -257,7 +219,40 @@ public class Coordinator extends BaseProcess{
         }
     }
 
+    private void printUiHelp() {
+        System.out.println("Comandos: ");
+        System.out.println("1 -> imprimir a fila de pedidos atual");
+        System.out.println("2 -> imprimir quantas vezes cada processo foi atendido (do log)");
+        System.out.println("3 -> encerrar a execução");
+        System.out.println("h -> ajuda");
+    }
 
+    private void printServiceCounts() {
+        ConcurrentHashMap<Integer, Integer> counts = new ConcurrentHashMap<>();
+        if (!logFile.exists()) {
+            System.out.println("Log não existe ainda.");
+            return;
+        }
+        try (BufferedReader br = new BufferedReader(new FileReader(logFile))) {
+            String l;
+            while ((l = br.readLine()) != null) {
+                if (l.contains("SENT_GRANT")) {
+                    String[] parts = l.split("\\s+");
+                    // assume last token is pid:x
+                    for (String p : parts) {
+                        if (p.startsWith("pid:")) {
+                            int pid = Integer.parseInt(p.substring(4));
+                            counts.merge(pid, 1, Integer::sum);
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        System.out.println("Atendimentos por processo:");
+        counts.forEach((k, v) -> System.out.println("pid " + k + ": " + v));
+    }
 
     public static void main(String[] args) throws Exception {
         int port = 5000;
