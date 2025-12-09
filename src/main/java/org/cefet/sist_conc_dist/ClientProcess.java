@@ -34,13 +34,20 @@
 
             for (int i = 0; i < repeticoes; i++) {
 
+                double randomico = Math.random();
+                System.out.println("randomico: " + randomico);
+                if(randomico < 0.7){
 
-                sendMessage(out, buildMessage(Operation.REQ.getEnumerated(), pid));
-                if(Math.random() > 0.5){
                     Random random = new Random();
-                    try { Thread.sleep( random.nextInt(0, 5) * 1000L );  }
-                    catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                    try {
+                        int segundos = random.nextInt(3, 5);
+                        System.out.println("Thread " + this.pid + " dormindo por " +  segundos + " segundos.");
+                        Thread.sleep( segundos * 1000L );
+                    } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                } else {
+                    System.out.println("Thread " + this.pid + " não dormiu.");
                 }
+                sendMessage(out, buildMessage(Operation.REQ.getEnumerated(), pid));
                 System.out.println("pid " + pid + " mandou REQUEST (" + (i+1) + "/" + repeticoes + ")");
 
 
@@ -57,6 +64,13 @@
 
                 System.out.println("pid " + pid + " recebeu GRANT, entrando na região critica.");
 
+                int segundos = new Random().nextInt(1, 3);
+                System.out.println("Thread " + this.pid + " escrevendo na RC por " +  segundos + " segundos.");
+                try {
+                    Thread.sleep( segundos * 1000L );
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
                 writeResult();
 
                 sendMessage(out, buildMessage(Operation.REL.getEnumerated(), pid));

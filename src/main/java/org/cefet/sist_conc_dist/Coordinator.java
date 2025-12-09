@@ -89,14 +89,17 @@ public class Coordinator extends BaseProcess{
     }
 
     private synchronized void processMessage(Message m) throws IOException, InterruptedException {
-        System.out.println("Chegou process message");
         Operation type = Operation.fromNumber(m.getType());
         int pid = m.getPid();
+        System.out.println("Chegou process message de pid: " + pid);
         System.out.println(type);
+
 
         if (type == Operation.REQ) {
             log("RECEIVED_REQUEST", pid);
-
+            if(requestQueue.isEmpty()){
+                System.out.println("fila req vazia, tratando pid " + pid);
+            }
             // Checa se está livre
             if (currentProcess == null) {
                 // Se estiver livre, manda o grant e marca ocupado
@@ -107,6 +110,7 @@ public class Coordinator extends BaseProcess{
                 // Se não estiver, adiciona na fila de requests (espera)
                 requestQueue.add(pid);
                 System.out.println("Fila atual: " + requestQueue);
+
                 log("QUEUE_ADD", pid);
             }
 
@@ -120,7 +124,7 @@ public class Coordinator extends BaseProcess{
                 // Se a fila não estiver vazia (tem clientes esperando)
                 if (!requestQueue.isEmpty()) {
                     int nextPid = requestQueue.poll(); // Tira da fila
-                    System.out.println("REL recebido, retidando da fila.");
+                    System.out.println("REL recebido, retirando da fila.");
                     System.out.println("Fila atual: " + requestQueue);
                     currentProcess = nextPid; // Marca como novo ocupante
                     sendGrant(nextPid); // Dá o grant
